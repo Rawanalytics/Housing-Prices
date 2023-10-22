@@ -1,0 +1,254 @@
+---
+title: "Predicting price"
+author: "Rawi Baransy"
+date: "2023-09-13"
+output:
+  pdf_document: default
+---
+
+```{r load library, results="hide"}
+library(neuralnet)
+library(kknn)
+library(data.table)
+library(rpart)
+library(ggcorrplot)
+library(corrplot)
+library(mltools)
+library(tidymodels)
+library(tidyverse)
+library(pan)
+library(mice)
+library(multiUS)
+library(dplyr)
+library(recipes)
+library(xgboost)
+library(neuralnet)
+library(tree)
+library(stringr)
+library(ggplot2)
+library(rpart.plot)
+library(yardstick)
+library(C50)
+library(tune)
+library(Hmisc)
+library(finetune)
+library(baguette)
+library(ggrepel)
+library(ggfortify)
+library(boot)
+```
+
+
+```{r load data, results="hide"}
+
+r_housing <- read_csv("r-housing.csv")
+```
+```{r adding the row to be predicted}
+#create observation
+input = c(2145000,	NA,	52,	1647,	39,	1996, 2306,	3, 3,	2,	1)
+
+#remove unimportant variables and add new input observation to data
+data_set = r_housing[,-c(5:8,10,11)]
+
+data_set_final = rbind(data_set,input)
+
+
+
+
+
+```
+
+
+```{r find normalization constants}
+standard_dev =sd(r_housing$`Sale Price`)
+
+avg = mean(r_housing$`Sale Price`)
+```
+
+
+
+```{r create training and prediciton data}
+#create train and predict data frames
+housing.train = as.data.frame(data_set_final[1:(nrow(data_set_final) -1),])
+
+housing.predict = as.data.frame(data_set_final[nrow(data_set_final),])
+
+#rename column 7
+colnames(housing.train)[7] ="Lot Size"
+colnames(housing.predict)[7] ="Lot Size"
+```
+
+
+
+```{r normalize training data and observations}
+
+
+  avg = 0
+  std = 0
+  
+  for(j in 1:(ncol(housing.train))){
+    avg[j] = mean(housing.train[,j])
+    std[j] = sd(housing.train[,j])
+    
+  
+    for(i in 1:nrow(housing.train)){
+      housing.train[i,j] = (housing.train[i,j] - avg[j])/std[j]
+    }
+  }
+  
+  housing.predict = (housing.predict - avg)/std
+  
+  
+ 
+```
+
+
+
+
+
+
+
+```{r model building}
+bag_tree_rpart_spec <-
+  rand_forest(mtry = 10, min_n = 1) %>%
+  set_engine('randomForest') %>%
+  set_mode('regression')
+
+
+boost_tree_xgboost_spec <-
+  boost_tree(tree_depth = tune(), trees = tune(), learn_rate = tune(), min_n = tune(), loss_reduction = tune(), sample_size = tune(), stop_iter = tune()) %>%
+  set_engine('xgboost') %>%
+  set_mode('regression')
+
+decision_tree_rpart_spec <-
+  decision_tree(tree_depth = tune(), min_n = tune(), cost_complexity = tune()) %>%
+  set_engine('rpart') %>%
+  set_mode('regression')
+
+linear_reg_lm_spec <-
+  linear_reg() %>%
+  set_engine('lm')
+
+Lasso_reg_lm_spec <-
+  linear_reg(penalty = tune(),mixture = 1) %>%
+  set_engine('glmnet')
+
+Ridge_reg_lm_spec <-
+  linear_reg(penalty = tune(),mixture = 0) %>%
+  set_engine('glmnet')
+
+Elastic_reg_lm_spec <-
+  linear_reg(penalty = tune(),mixture = 0.5) %>%
+  set_engine('glmnet')
+
+mlp_nnet_spec <-
+  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_engine('nnet') %>%
+  set_mode('regression')
+
+
+nearest_neighbor_kknn_spec <-
+  nearest_neighbor(neighbors = tune(), weight_func = tune(), dist_power = tune()) %>%
+  set_engine('kknn') %>%
+  set_mode('regression')
+
+rand_forest_randomForest_spec <-
+  rand_forest(mtry = 3, min_n = tune()) %>%
+  set_engine('randomForest') %>%
+  set_mode('regression') 
+
+
+```
+
+
+
+```{r create v-folds}
+set.seed(1)
+k_fold = vfold_cv(housing.train, repeats = 5)
+```
+
+```{r building workflow}
+set.seed(1)
+
+
+prep = recipe(`Sale Price` ~ ., data = housing.train)
+
+all_workflows <- workflow_set(preproc = list(prepare = prep),
+                           models = list(Bagging = bag_tree_rpart_spec, Xgboost = boost_tree_xgboost_spec, Tree = decision_tree_rpart_spec, neural_network = mlp_nnet_spec, Forest = rand_forest_randomForest_spec, nearest_neighbor_kknn_spec, Lasso = Lasso_reg_lm_spec, Ridge = Ridge_reg_lm_spec, Elastic = Elastic_reg_lm_spec, Linear = linear_reg_lm_spec))
+ 
+```
+
+
+
+```{r tune grid}
+grid_ctrl <-
+   control_sim_anneal(
+      save_pred = TRUE,
+      parallel_over = "everything",
+      save_workflow = TRUE
+    
+   )
+
+
+grid_results <-
+   all_workflows %>%
+   workflow_map(
+      seed = 1,
+      fn = "tune_sim_anneal",
+      resamples = k_fold,
+        iter = 15,
+     metrics = metric_set(rmse),
+      control = grid_ctrl
+   )
+```
+
+```{r visualize model results}
+
+
+autoplot(
+   grid_results,
+   rank_metric = "rmse",  # <- how to order models
+   metric = "rmse",       # <- which metric to visualize
+   select_best = TRUE     # <- one point per workflow
+) +geom_text_repel(aes(label = wflow_id), nudge_x = 1/8, nudge_y = 1/100) +
+  theme(legend.position = "none")
+```
+
+
+
+```{r best model hyperparameters}
+best_results <- 
+   grid_results %>% 
+   extract_workflow_set_result("prepare_Lasso") %>% 
+   select_best(metric = "rmse")
+best_results
+
+
+```
+
+```{r build final model and predicitons}
+
+lasso_spec <-
+  linear_reg(penalty = best_results$penalty,mixture = 1) %>%
+  set_engine('glmnet') 
+
+
+wf <- workflow(preproc = prep)
+
+ lasso_fit <- wf %>%
+  add_model(lasso_spec) %>% 
+  fit(data = housing.train)
+
+
+```
+
+
+
+
+```{r prediciton}
+#create prediction
+prediction = as.numeric(predict(lasso_fit,housing.predict[,-2] ) *std[2] + avg[2])
+
+prediction
+
+```
